@@ -1,27 +1,29 @@
 """
 ==========================================================
 MPSC Question Paper Ingestion & Editor Tool (Gemini AI Powered)
-Version : 19.0 (Null-Language Fields + Resumable Continuation Extraction)
+Version : 21.0 (Salvage-Parse + Retry/Backoff + Bilingual-Order-Safe)
 Author  : Tejas Doiphode
 
-Features
----------
-✓ 20 Quantitative Aptitude micro-topics added directly from Image Index (Subject ID: 17)
-✓ 37 Intelligence/Reasoning micro-topics added directly from Image Index (Subject ID: 18)
-✓ 2 Logical Reasoning & Decision Making micro-topics added directly from Image Index (Subject ID: 19)
-✓ All previous Polity (19), History (26), Geography (28), Science (29), Economics (16) topics maintained
-✓ Concurrent Dual-PDF Processing: Upload Question Paper PDF & Answer Key PDF together
-✓ NEW: If a question exists in the source PDF in only ONE language, that
-  language is extracted as-is and the OTHER language is set to null in the
-  JSON (no fabricated translation). If both languages are present in the
-  source, both are extracted as "English Text [[MR]] मराठी मजकूर".
-✓ NEW: Resumable / continuation extraction — if a run only returns a partial
-  set of questions (e.g. 30 of 100, due to model output limits), you can
-  upload that partial JSON back in and continue extraction from the next
-  question number using the same paper PDF, appending results until the
-  full paper is covered.
-✓ Auto-assigns correct_option directly from Answer Key PDF via Gemini AI
-✓ Safe NoneType handling for null options/strings
+WHAT'S FIXED IN THIS VERSION:
+------------------------------
+✓ Salvage-parsing: a truncated ("Unterminated string...") Gemini response no
+  longer crashes the whole run -- every COMPLETE question object recovered
+  from a cut-off response is kept, and you're told how many via a warning.
+✓ Per-model error visibility: every model's actual failure reason is shown
+  live (previously only the LAST model's error was visible, hiding real
+  causes like 404/429/503 on earlier attempts).
+✓ Retry-with-backoff for 429 (quota) and 503 (timeout) errors -- retries the
+  same model briefly instead of just cascading to the next model blindly.
+✓ Bilingual ordering safety net: regardless of which model answers, or
+  whether it obeys the "English first" prompt instruction, the code now
+  detects Devanagari script and force-corrects the order to always be
+  "English [[MR]] Marathi" -- never depends on model compliance alone.
+✓ IMPORTANT: candidate_models below is a best-guess list based on this
+  conversation. Gemini model availability has been shifting rapidly and
+  this environment cannot verify live model IDs. BEFORE relying on this,
+  check https://ai.google.dev/gemini-api/docs/models or your AI Studio
+  console's model picker for the exact model names currently enabled on
+  YOUR API key, and edit CANDIDATE_MODELS below accordingly.
 ==========================================================
 """
 
@@ -29,6 +31,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime
 
 import streamlit as st
@@ -409,19 +412,25 @@ def init_session():
 
 init_session()
 
+# --------------------------------------------------------
+# IMPORTANT: verify these model names against your own AI Studio console
+# (https://ai.google.dev/gemini-api/docs/models) before relying on this
+# list -- Gemini model availability has shifted multiple times during this
+# conversation and cannot be verified from here. Edit freely.
+# --------------------------------------------------------
+CANDIDATE_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+]
+
 
 # --------------------------------------------------------
 # 2. Gemini PDF Extraction Prompts & Functions
 # --------------------------------------------------------
 
 def build_dual_pdf_prompt(subjects, topics, has_key_pdf=False, start_question=None):
-    """Builds an integrated Gemini prompt for processing Question Paper PDF and optional Answer Key PDF concurrently.
-
-    If start_question is provided, the model is instructed to skip all
-    questions before that number (they were already extracted in a previous
-    run) and continue extracting from that question number to the end of the
-    paper — used for resumable/continuation extraction.
-    """
+    """Builds an integrated Gemini prompt for processing Question Paper PDF and optional Answer Key PDF concurrently."""
     subject_lookup = [{"id": s["id"], "name": s["name"]} for s in subjects]
     topic_lookup = [{"id": t["id"], "subject_id": t["subject_id"], "name": t["name"]} for t in topics]
 
@@ -462,10 +471,18 @@ Task:
      (`question_text`, `option_a`, `option_b`, `option_c`, `option_d`):
      a) If BOTH English and Marathi are printed for that field in the source
         PDF (as is common in MPSC bilingual papers), output it as:
-        "English Text [[MR]] मराठी मजकूर" — English first, then the literal
-        separator ` [[MR]] `, then the Marathi text, using the wording
-        exactly as printed in the source (do not paraphrase or re-translate
-        text that is already given in both languages).
+        "English Text [[MR]] मराठी मजकूर"
+
+        STRICT ORDER RULE (non-negotiable, applies no matter how the source
+        page is laid out): The ENGLISH portion ALWAYS comes FIRST, before
+        the literal separator ` [[MR]] `. The MARATHI portion ALWAYS comes
+        AFTER the separator. This is true even if the source PDF visually
+        prints the Marathi line above or before the English line on the
+        page — you must still REORDER your output text so English appears
+        first and Marathi appears second, joined by ` [[MR]] `. Never place
+        Marathi text before the `[[MR]]` marker. Never place English text
+        after it. Do not paraphrase or re-translate the wording itself —
+        only correct which language comes first in the output string.
      b) If ONLY English is printed for that field in the source PDF, output
         the field containing ONLY that English text, exactly as printed —
         and set the corresponding "*_mr" null-flag field (see field list
@@ -500,6 +517,10 @@ Reference Subjects List:
 Reference Topics List:
 {json.dumps(topic_lookup, ensure_ascii=False)}
 
+REMINDER BEFORE YOU OUTPUT: Every bilingual field must be English text FIRST,
+then ` [[MR]] `, then Marathi text SECOND — regardless of source page layout.
+Double-check this ordering for every field before finalizing your JSON.
+
 Output MUST be a strictly valid JSON array of objects. Return ONLY raw JSON array without markdown backticks.
 
 Example Output Structure (bilingual question, both languages present in source):
@@ -526,7 +547,7 @@ Example Output Structure (bilingual question, both languages present in source):
     "subject_id": 5,
     "topic_id": 522,
     "explanation": "The Quit India Movement was launched by Mahatma Gandhi on 8 August 1942 at the Bombay session of AICC with the slogan Do or Die. [[MR]] महात्मा गांधींनी ८ ऑगस्ट १९४२ रोजी ऑल इंडिया काँग्रेस कमिटीच्या मुंबई अधिवेशनात 'करा किंवा मरा' चा नारा देऊन 'भारत छोडो चळवळ' सुरू केली होती.",
-    "explanation_detail": "Gandhi gave the historic slogan \"Do or Die\" (Karo ya Maro). The British immediately arrested Gandhi, Nehru and other Congress leaders. Major centres of revolt included Satara in Maharashtra, Midnapur in Bengal, and Ballia in UP. The movement was largely suppressed by 1944. [[MR]] गांधीजींनी \"करा किंवा मरा\" ही ऐतिहासिक घोषणा दिली. ब्रिटिशांनी लागलीच गांधीजी, नेहरू आणि काँग्रेसच्या इतर प्रमुख नेत्यांना अटक केली. या उठावाच्या प्रमुख केंद्रांमध्ये महाराष्ट्रातील सातारा, बंगालमधील मिदनापूर आणि उत्तर प्रदेशातील बलिया यांचा समावेश होता. १९४४ पर्यंत ही चळवळ मोठ्या प्रमाणावर दडपली गेली.",
+    "explanation_detail": "Gandhi gave the historic slogan \\"Do or Die\\" (Karo ya Maro). The British immediately arrested Gandhi, Nehru and other Congress leaders. Major centres of revolt included Satara in Maharashtra, Midnapur in Bengal, and Ballia in UP. The movement was largely suppressed by 1944. [[MR]] गांधीजींनी \\"करा किंवा मरा\\" ही ऐतिहासिक घोषणा दिली. ब्रिटिशांनी लागलीच गांधीजी, नेहरू आणि काँग्रेसच्या इतर प्रमुख नेत्यांना अटक केली. या उठावाच्या प्रमुख केंद्रांमध्ये महाराष्ट्रातील सातारा, बंगालमधील मिदनापूर आणि उत्तर प्रदेशातील बलिया यांचा समावेश होता. १९४४ पर्यंत ही चळवळ मोठ्या प्रमाणावर दडपली गेली.",
     "explanation_image1": null
   }},
   {{
@@ -555,43 +576,55 @@ Example Output Structure (bilingual question, both languages present in source):
     "explanation_image1": null
   }}
 ]
-
-Note: in the second example, the source PDF had this question in English
-only, so all "*_mr_missing" flags for that question are true (Marathi is
-absent in the source), and the tool downstream will store null for the
-Marathi side of those fields — while "explanation"/"explanation_detail"
-remain bilingual per rule 10, since those are AI-generated, not source text.
 """
     return prompt
+
+
+DEVANAGARI_PATTERN = re.compile(r'[\u0900-\u097F]')
+
+
+def _fix_bilingual_field_order(raw_value):
+    """Guarantees 'English [[MR]] Marathi' order regardless of what order
+    the model actually produced. Some models sometimes ignore the prompt's
+    ordering instruction and put Marathi first. This detects Devanagari
+    script to identify which side is Marathi and swaps the halves if the
+    model got the order backwards."""
+    if not raw_value or "[[MR]]" not in raw_value:
+        return raw_value
+
+    parts = raw_value.split("[[MR]]")
+    if len(parts) != 2:
+        return raw_value
+
+    left, right = parts[0].strip(), parts[1].strip()
+
+    left_is_marathi = bool(DEVANAGARI_PATTERN.search(left))
+    right_is_marathi = bool(DEVANAGARI_PATTERN.search(right))
+
+    if left_is_marathi and not right_is_marathi:
+        return f"{right} [[MR]] {left}"
+
+    return raw_value
 
 
 def _apply_null_language_flags(item):
     """Given a raw Gemini-extracted question dict (with bilingual '[[MR]]'
     text and boolean *_missing flags), returns a new dict where question_text
-    and option_a-d are split into explicit language-null-aware values:
-    - If both languages present: keep the combined "English [[MR]] Marathi" string.
-    - If only English present: keep only English text, no [[MR]] marker.
-    - If only Marathi present: keep only Marathi text, no [[MR]] marker.
-    A missing language is represented as null in the accompanying
-    "<field>_language" metadata so downstream consumers know which
-    language(s) are actually populated.
-    """
+    and option_a-d are split into explicit language-null-aware values."""
     def process_field(field_name):
         raw_value = item.get(field_name, "") or ""
+        raw_value = _fix_bilingual_field_order(raw_value)
         mr_missing = bool(item.get(f"{field_name}_mr_missing", False))
         en_missing = bool(item.get(f"{field_name}_en_missing", False))
 
         if mr_missing and not en_missing:
-            # Only English present in source; strip any accidental [[MR]] content.
             eng_part = raw_value.split("[[MR]]")[0].strip()
             return eng_part, "EN", None
         elif en_missing and not mr_missing:
-            # Only Marathi present in source; strip any accidental [[MR]] content.
             parts = raw_value.split("[[MR]]")
             mar_part = parts[-1].strip() if len(parts) > 1 else raw_value.strip()
             return mar_part, "MR", None
         else:
-            # Both present (or flags absent/ambiguous) -> keep combined bilingual value.
             return raw_value, "EN_MR", raw_value
 
     result = {}
@@ -602,14 +635,56 @@ def _apply_null_language_flags(item):
     return result
 
 
+def safe_parse_json_array(raw_text):
+    """Parse a Gemini JSON-array response. If truncated mid-object
+    (MAX_TOKENS cutoff), salvage every COMPLETE object instead of
+    discarding the whole batch. Returns (parsed_list, was_truncated)."""
+    raw_text = (raw_text or "").strip()
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:]
+    if raw_text.startswith("```"):
+        raw_text = raw_text[3:]
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+    raw_text = raw_text.strip()
+
+    if not raw_text:
+        return [], True
+
+    try:
+        return json.loads(raw_text), False
+    except json.JSONDecodeError:
+        pass
+
+    last_good = raw_text.rfind("},")
+    if last_good != -1:
+        salvage = raw_text[:last_good + 1] + "]"
+        try:
+            return json.loads(salvage), True
+        except json.JSONDecodeError:
+            pass
+
+    return [], True
+
+
+def _extract_retry_delay(err):
+    """Pull Google's suggested retryDelay (seconds) out of a 429 error, if present."""
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+)", str(err))
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def _extract_pdfs_with_gemini_core(paper_pdf, key_pdf, api_key, start_question=None):
     """Shared core: uploads PDFs, builds the prompt (optionally with a
-    continuation start_question), calls Gemini across candidate models, and
-    returns the parsed raw JSON array (before null-language post-processing)."""
+    continuation start_question), calls Gemini across candidate models with
+    per-model error visibility and 429/503 retry, and returns the parsed
+    (salvage-safe) JSON array."""
     client = genai.Client(api_key=api_key)
 
     tmp_paths = []
     gemini_files = []
+    status_box = st.empty()
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_p:
@@ -647,30 +722,45 @@ def _extract_pdfs_with_gemini_core(paper_pdf, key_pdf, api_key, start_question=N
         )
         contents_payload.append(prompt_text)
 
-        # Same Gemini model list as the original working code.
-        candidate_models = [
-            "gemini-2.5-flash",
-            "gemini-3.5-flash",
-            "gemini-1.5-flash",
-            "gemini-2.0-flash",
-        ]
-
         response = None
-        last_error = None
+        all_errors = []
 
-        for model_name in candidate_models:
-            try:
-                st.info(f"मॉडेल `{model_name}` द्वारे प्रक्रिया चालू आहे...")
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents_payload
-                )
-                if response and response.text:
-                    st.success(f"मॉडेल `{model_name}` द्वारे PDF यशस्वीरीत्या विश्लेषित झाली!")
-                    break
-            except Exception as err:
-                last_error = err
+        for model_name in CANDIDATE_MODELS:
+            for attempt in range(2):
+                try:
+                    status_box.info(f"[{datetime.now().strftime('%H:%M:%S')}] मॉडेल `{model_name}` प्रयत्न {attempt + 1}/2...")
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents_payload,
+                        config=types.GenerateContentConfig(
+                            max_output_tokens=65536,
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                        )
+                    )
+                    if response and response.text:
+                        status_box.success(f"✅ मॉडेल `{model_name}` द्वारे PDF यशस्वीरीत्या विश्लेषित झाली!")
+                        break
+                except Exception as err:
+                    err_str = str(err)
+                    all_errors.append(f"{model_name} (प्रयत्न {attempt + 1}): {err_str}")
+
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        delay = _extract_retry_delay(err) or 30
+                        status_box.warning(f"⏳ `{model_name}` quota संपली — {delay}s थांबून पुन्हा प्रयत्न करत आहे...")
+                        time.sleep(delay + 2)
+                        continue
+                    elif "503" in err_str or "UNAVAILABLE" in err_str or "Deadline expired" in err_str:
+                        status_box.warning(f"⏳ `{model_name}` सर्व्हर timeout — 10s थांबून पुन्हा प्रयत्न करत आहे...")
+                        time.sleep(10)
+                        continue
+                    else:
+                        status_box.error(f"❌ `{model_name}` अयशस्वी: {err_str}")
+                        break
+            else:
                 continue
+            if response and response.text:
+                break
 
         for g_file in gemini_files:
             try:
@@ -683,17 +773,18 @@ def _extract_pdfs_with_gemini_core(paper_pdf, key_pdf, api_key, start_question=N
                 os.remove(path)
 
         if not response or not response.text:
-            raise Exception(f"सर्व मॉडेल निष्फळ ठरले. शेवटची त्रुटी: {last_error}")
+            raise Exception("सर्व मॉडेल निष्फळ ठरले:\n" + "\n".join(all_errors))
 
-        raw_text = response.text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
+        raw_text = response.text
+        parsed_json, was_truncated = safe_parse_json_array(raw_text)
 
-        parsed_json = json.loads(raw_text.strip())
+        if was_truncated:
+            st.warning(
+                f"⚠️ प्रतिसाद अपूर्ण आला (token limit मुळे). जितके प्रश्न पूर्ण मिळाले "
+                f"({len(parsed_json)}) तितकेच जतन केले आहेत. उर्वरित प्रश्नांसाठी "
+                f"Continuation पद्धत वापरा."
+            )
+
         return parsed_json
 
     except Exception as e:
@@ -744,26 +835,36 @@ def extract_answer_key_from_pdf(pdf_file, api_key):
         tmp_file.write(pdf_file.getvalue())
         tmp_path = tmp_file.name
 
+    status_box = st.empty()
+
     try:
         gemini_file = client.files.upload(file=tmp_path)
 
-        candidate_models = [
-            "gemini-2.5-flash",
-            "gemini-3.5-flash",
-            "gemini-1.5-flash",
-            "gemini-2.0-flash",
-        ]
-
         response = None
-        for model_name in candidate_models:
+        all_errors = []
+
+        for model_name in CANDIDATE_MODELS:
             try:
+                status_box.info(f"मॉडेल `{model_name}` द्वारे उत्तरतालिका वाचत आहे...")
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=[gemini_file, ANSWER_KEY_PROMPT]
+                    contents=[gemini_file, ANSWER_KEY_PROMPT],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    )
                 )
                 if response and response.text:
+                    status_box.success(f"✅ मॉडेल `{model_name}` यशस्वी!")
                     break
-            except Exception:
+            except Exception as err:
+                err_str = str(err)
+                all_errors.append(f"{model_name}: {err_str}")
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    delay = _extract_retry_delay(err) or 20
+                    status_box.warning(f"⏳ `{model_name}` quota संपली — {delay}s थांबत आहे...")
+                    time.sleep(delay + 2)
+                else:
+                    status_box.warning(f"मॉडेल `{model_name}` अयशस्वी: {err_str}")
                 continue
 
         try:
@@ -775,6 +876,7 @@ def extract_answer_key_from_pdf(pdf_file, api_key):
             os.remove(tmp_path)
 
         if not response or not response.text:
+            st.error("सर्व मॉडेल निष्फळ ठरले:\n" + "\n".join(all_errors))
             return {}
 
         raw_text = response.text.strip()
@@ -784,8 +886,13 @@ def extract_answer_key_from_pdf(pdf_file, api_key):
             raw_text = raw_text[3:]
         if raw_text.endswith("```"):
             raw_text = raw_text[:-3]
+        raw_text = raw_text.strip()
 
-        return json.loads(raw_text.strip())
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError as parse_err:
+            st.warning(f"उत्तरतालिका प्रतिसाद अपूर्ण होता: {parse_err}")
+            return {}
 
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -834,22 +941,10 @@ def apply_answer_key_text(answer_text):
 
 
 def build_one_line_per_record_json(final_json):
-    """Serializes final_json so that:
-    - the top-level structure (generated_at, exam_type, ..., subjects, topics,
-      questions) stays multi-line and readable, and
-    - EVERY individual subject object, topic object, and question object is
-      rendered on its own single line (no field-by-field line breaks inside
-      an object), so scanning/searching the file by subject/topic/question is
-      easy (one subject per line, one topic per line, one question per line).
-
-    Embedded newlines inside string values (e.g. explanation_detail's "\\n")
-    remain valid JSON escape sequences and do not break the one-line-per-record
-    layout, since json.dumps already escapes them as "\\n" rather than literal
-    newlines.
-    """
+    """Serializes final_json so that every subject/topic/question object is
+    rendered on its own single line, while the top-level structure stays
+    multi-line and readable."""
     def compact_item(item):
-        # separators=(',', ': ') keeps a readable "key": value spacing while
-        # still emitting the whole object on a single line.
         return json.dumps(item, ensure_ascii=False, separators=(',', ': '))
 
     def render_array(key, items, indent="  "):
@@ -981,11 +1076,31 @@ with c_api:
         type="password",
         help="https://aistudio.google.com/ वरून मोफत की मिळवा"
     )
+    st.caption(f"वापरले जाणारे मॉडेल (प्राधान्यक्रमाने): {', '.join(CANDIDATE_MODELS)}")
 
 with c_meta:
     col1, col2, col3 = st.columns(3)
 
-    exam_types = ["MPSC_GROUP_B_COMBINE", "MPSC_GROUP_C_COMBINE", "MPSC_RAJYASEVA", "OTHER"]
+    exam_types = [
+        'MPSC_RAJYASEVA',
+        'MPSC_FOREST_SERVICES',
+        'MPSC_ENGG_SERVICES',
+        'MPSC_CIVIL_ENGG',
+        'MPSC_AGRI_SERVICES',
+        'MPSC_GROUP_B_COMBINE',
+        'MPSC_ASO',
+        'MPSC_STI',
+        'MPSC_PSI',
+        'MPSC_DEPT_PSI',
+        'MPSC_DEPT_ASO',
+        'MPSC_GROUP_C_COMBINE',
+        'MPSC_TAX_ASSISTANT',
+        'MPSC_CLERK_TYPIST',
+        'MPSC_TECH_ASSISTANT',
+        'MPSC_AMVI',
+        'MPSC_EXCISE_SI',
+        'OTHER'
+    ]
     paper_stages = ["PRELIMS", "MAINS"]
     languages = ["EN_MR", "MR", "EN"]
 
@@ -1109,8 +1224,6 @@ with tab_pdf:
                     existing_raw_questions = partial_content.get("questions", [])
                     existing_formatted = []
                     for item in existing_raw_questions:
-                        # Already-exported questions are in final format; load them directly
-                        # (they already have null-language handling baked in from their own export).
                         existing_formatted.append({
                             "question_number": item.get("question_number", 0),
                             "question_text": item.get("question_text", ""),
@@ -1148,7 +1261,6 @@ with tab_pdf:
                         if continuation_data:
                             new_formatted = [build_formatted_question(item, language) for item in continuation_data]
 
-                            # Merge: keep existing questions, append only new question_numbers not already present.
                             existing_numbers = {q["question_number"] for q in existing_formatted}
                             appended = [q for q in new_formatted if q["question_number"] not in existing_numbers]
 
@@ -1272,13 +1384,22 @@ with tab_key:
 if st.session_state.parsed_questions:
     st.divider()
     st.subheader("लोड केलेल्या माहितीचा सारांश")
-    s1, s2, s3 = st.columns(3)
+    s1, s2, s3, s4 = st.columns(4)
     with s1:
         st.metric("एकूण प्रश्न", len(st.session_state.parsed_questions))
     with s2:
         st.metric("भाषा मोड", st.session_state.paper_info.get("language", "EN_MR"))
     with s3:
         st.metric("वर्ष", st.session_state.paper_info.get("year", 2026))
+    with s4:
+        q_numbers = sorted(int(q.get("question_number", 0)) for q in st.session_state.parsed_questions)
+        gaps = []
+        if q_numbers:
+            full_range = set(range(q_numbers[0], q_numbers[-1] + 1))
+            gaps = sorted(full_range - set(q_numbers))
+        st.metric("क्रम-अंतर (Gaps)", len(gaps))
+        if gaps:
+            st.caption(f"⚠️ चुकलेले प्रश्न क्रमांक: {gaps}")
 
     st.divider()
     st.header("पायरी ३ : प्रश्नांचे परीक्षण व संपादन (Review & Edit)")
@@ -1289,7 +1410,6 @@ if st.session_state.parsed_questions:
     for i, q in enumerate(st.session_state.parsed_questions):
         sub_name = subject_dict.get(q.get("subject_id"), "अवर्गीकृत")
 
-        # SAFE STRING EXTRACTION FIX TO PREVENT 'NoneType' object has no attribute 'strip'
         raw_corr = q.get("correct_option")
         cur_corr = str(raw_corr).strip().upper() if raw_corr is not None else ""
 
@@ -1298,12 +1418,10 @@ if st.session_state.parsed_questions:
         title = f"प्र. {q['question_number']} [{sub_name}]{corr_str}{lang_badge} - {str(q.get('question_text', ''))[:60]}..."
 
         with st.expander(title, expanded=False):
-            # Question Statement & Question Diagram
             q["question_text"] = st.text_area("प्रश्न विधान", value=str(q.get("question_text", "")), height=120, key=f"q_{i}")
             st.caption(f"स्रोत भाषा: {q.get('question_text_language', 'EN_MR')} (EN = फक्त इंग्रजी, MR = फक्त मराठी, EN_MR = दोन्ही)")
             q["question_image"] = st.text_input("प्रश्नाची आकृती / इमेज URL (`question_image`)", value=str(q.get("question_image") or ""), key=f"q_img_{i}")
 
-            # Options
             c_opt1, c_opt2 = st.columns(2)
             with c_opt1:
                 q["option_a"] = st.text_input("पर्याय १ (A)", value=str(q.get("option_a", "")), key=f"a_{i}")
@@ -1312,7 +1430,6 @@ if st.session_state.parsed_questions:
                 q["option_b"] = st.text_input("पर्याय २ (B)", value=str(q.get("option_b", "")), key=f"b_{i}")
                 q["option_d"] = st.text_input("पर्याय ४ (D)", value=str(q.get("option_d", "")), key=f"d_{i}")
 
-            # Correct Answer, Difficulty & Subject Selection
             m_col1, m_col2, m_col3 = st.columns(3)
 
             opts_corr = ["", "A", "B", "C", "D"]
@@ -1334,7 +1451,6 @@ if st.session_state.parsed_questions:
                 subject_id = st.selectbox("मुख्य विषय", options=sub_keys, format_func=lambda x: subject_dict[x], index=sub_idx, key=f"sub_{i}")
                 q["subject_id"] = subject_id if subject_id != -1 else None
 
-            # Dynamic Topics Assignment
             if subject_id != -1 and subject_id is not None:
                 topics = [t for t in st.session_state.topics if t["subject_id"] == subject_id]
                 topic_dict = {t["id"]: t["name"] for t in topics}
@@ -1351,7 +1467,6 @@ if st.session_state.parsed_questions:
                 q["new_subject_name"] = st.text_input("नवीन विषयाचे नाव", value=str(q.get("new_subject_name", "")), key=f"n_sub_{i}")
                 q["new_topic_name"] = st.text_input("नवीन उपघटकाचे नाव", value=str(q.get("new_topic_name", "")), key=f"n_top_{i}")
 
-            # Explanations & Images
             q["explanation"] = st.text_area("स्पष्टीकरण (English [[MR]] Marathi)", value=str(q.get("explanation", "")), height=70, key=f"exp_{i}")
             q["explanation_detail"] = st.text_area("सविस्तर स्पष्टीकरण (English [[MR]] Marathi)", value=str(q.get("explanation_detail", "")), height=100, key=f"exp_det_{i}")
 
@@ -1424,13 +1539,6 @@ if st.session_state.parsed_questions:
             e_img = q.get("explanation_image1")
             e_img_val = str(e_img).strip() if e_img and str(e_img).strip() else None
 
-            # Per-field null-language values: if a field's detected language is
-            # "EN" only, store it under question_text/option_* as English text
-            # (language metadata says EN) -- the field itself is never
-            # fabricated into a language that wasn't in the source. Downstream
-            # consumers can check "<field>_language" to know whether to treat
-            # the value as English-only, Marathi-only, or bilingual, and can
-            # render/query the "missing" side as null based on that flag.
             exported_questions.append({
                 "id": None,
                 "subject_id": subject_id,
@@ -1464,10 +1572,6 @@ if st.session_state.parsed_questions:
             "questions": exported_questions
         }
 
-        # FIX: one subject per line, one topic per line, one question per
-        # line — instead of the default indent=2 pretty-printer, which spreads
-        # every field of every object across its own line and makes the file
-        # hard to scan/search record-by-record.
         json_string = build_one_line_per_record_json(final_json)
         filename = f"{st.session_state.paper_info['exam_type']}_{st.session_state.paper_info['paper_stage']}_{st.session_state.paper_info['year']}_P{st.session_state.paper_info['paper_number']}.json"
 
