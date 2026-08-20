@@ -650,6 +650,7 @@ def _extract_pdfs_with_gemini_core(paper_pdf, key_pdf, api_key, start_question=N
         # Same Gemini model list as the original working code.
         candidate_models = [
             "gemini-2.5-flash",
+            "gemini-3.6-flash",
             "gemini-3.5-flash",
             "gemini-1.5-flash",
             "gemini-2.0-flash",
