@@ -419,6 +419,7 @@ init_session()
 # conversation and cannot be verified from here. Edit freely.
 # --------------------------------------------------------
 CANDIDATE_MODELS = [
+    "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
@@ -726,9 +727,9 @@ def _extract_pdfs_with_gemini_core(paper_pdf, key_pdf, api_key, start_question=N
         all_errors = []
 
         for model_name in CANDIDATE_MODELS:
-            for attempt in range(2):
+            for attempt in range(1):
                 try:
-                    status_box.info(f"[{datetime.now().strftime('%H:%M:%S')}] मॉडेल `{model_name}` प्रयत्न {attempt + 1}/2...")
+                    status_box.info(f"[{datetime.now().strftime('%H:%M:%S')}] मॉडेल `{model_name}` प्रयत्न {attempt + 1}")
                     response = client.models.generate_content(
                         model=model_name,
                         contents=contents_payload,
