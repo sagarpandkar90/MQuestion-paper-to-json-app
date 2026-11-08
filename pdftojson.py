@@ -422,7 +422,8 @@ CANDIDATE_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite"
+
 ]
 
 
@@ -1289,11 +1290,14 @@ with tab_json:
                 st.session_state.paper_info["paper_number"] = content.get("paper_number", paper_number)
                 st.session_state.paper_info["paper_label"] = content.get("paper_label", paper_label)
 
-                if "subjects" in content and isinstance(content["subjects"], list):
-                    st.session_state.subjects = content["subjects"]
-                if "topics" in content and isinstance(content["topics"], list):
-                    st.session_state.topics = content["topics"]
+                loaded_subjects = content.get("subjects")
+                loaded_topics = content.get("topics")
 
+                # Only override the built-in syllabus if the file actually contains data.
+                if isinstance(loaded_subjects, list) and len(loaded_subjects) > 0:
+                    st.session_state.subjects = loaded_subjects
+                if isinstance(loaded_topics, list) and len(loaded_topics) > 0:
+                    st.session_state.topics = loaded_topics
                 raw_questions = content.get("questions", [])
                 loaded_questions = []
 
